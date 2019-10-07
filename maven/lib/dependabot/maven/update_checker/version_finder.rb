@@ -32,6 +32,7 @@ module Dependabot
           possible_versions = filter_ignored_versions(possible_versions)
 
           possible_versions.reverse.find { |v| released?(v.fetch(:version)) }
+
         end
 
         def lowest_security_fix_version_details
@@ -62,7 +63,34 @@ module Dependabot
             raise PrivateSourceAuthenticationFailure, forbidden_urls.first
           end
 
-          version_details.sort_by { |details| details.fetch(:version) }
+          sorted_versions = version_details.sort_by { |details| details.fetch(:version) }
+
+          # check if the latest version may have relocation information
+          latest_version = sorted_versions.last
+          relocationMetadata = fetchRelocationMetadata(latest_version, repositories)
+          unless relocationMetadata.nil?
+            new_group_id = relocationMetadata.css("groupId").text
+            new_artifact_id = relocationMetadata.css("artifactId").text
+            relocation_message = relocationMetadata.css("message").text
+            @relocationMetadata = {:new_group_id => new_group_id, :new_artifact_id => new_artifact_id, :message => relocation_message}
+            # TODO remove
+            puts "Dependency is relocated:"
+            puts "=> new groupid #{new_group_id} (old was #{dependency.name.split(":").first})"
+            puts "=> new artifactid #{new_artifact_id} (old was #{dependency.name.split(":").last})"
+            puts "=> message: #{relocation_message}"
+
+            repository_details = determineSourceRepository(latest_version, repositories)
+            relocatedVersions =  dependency_metadata_custom_coordinates(repository_details, new_group_id, new_artifact_id)
+            repository_url = repository_details.fetch("url")
+            new_versions = relocatedVersions.
+                css("versions > version").
+                select { |node| version_class.correct?(node.content) }.
+                map { |node| version_class.new(node.content) }.
+                map { |version| { version: version, source_url: repository_url } }
+            sorted_versions.concat(new_versions)
+          end
+
+          sorted_versions = sorted_versions.sort_by { |details| details.fetch(:version) }
         end
 
         private
@@ -147,38 +175,81 @@ module Dependabot
                 idempotent: true,
                 **SharedHelpers.excon_defaults
               )
-
               artifact_id = dependency.name.split(":").last
+              if response.status == 404 && !@relocationMetadata.nil?
+                response = Excon.get(
+                  dependency_files_url_custom_coordinates(
+                    url,
+                    version,
+                    @relocationMetadata[:new_group_id],
+                    @relocationMetadata[:new_artifact_id]),
+                  user: repository_details.fetch("username"),
+                  password: repository_details.fetch("password"),
+                  idempotent: true,
+                  **SharedHelpers.excon_defaults
+                )
+                artifact_id = @relocationMetadata[:new_artifact_id]
+              end
+
               type = dependency.requirements.first.
                      dig(:metadata, :packaging_type)
-              response.body.include?("#{artifact_id}-#{version}.#{type}")
+              released = response.body.include?("#{artifact_id}-#{version}.#{type}")
             rescue Excon::Error::Socket, Excon::Error::Timeout,
                    Excon::Error::TooManyRedirects
               false
             end
         end
 
+        def fetchRelocationMetadata(maven_version, repositories)
+          repository_details = determineSourceRepository(maven_version, repositories)
+          fetchAsXml(dependency_pom(maven_version), repository_details).
+            css("distributionManagement > relocation")
+        end
+
+        def determineSourceRepository(maven_version, repositories)
+          repository_details = repositories
+            .select { |r| r.fetch("url") == maven_version&.fetch(:source_url) }
+            .first
+        end
+
+        def dependency_metadata_custom_coordinates(repository_details, new_group_id, new_artifact_id)
+          # TODO should be cached
+          fetchAsXml(
+            dependency_metadata_url_custom_coordinates(
+              repository_details.fetch("url"),
+              new_group_id,
+              new_artifact_id),
+              repository_details
+          )
+        end
+
+        def fetchAsXml(url, repository_details)
+          begin
+            response = Excon.get(
+              url,
+              user: repository_details.fetch("username"),
+              password: repository_details.fetch("password"),
+              idempotent: true,
+              **Dependabot::SharedHelpers.excon_defaults
+            )
+            check_response(response, repository_details.fetch("url"))
+            Nokogiri::XML(response.body)
+          rescue URI::InvalidURIError
+            Nokogiri::XML("")
+          rescue Excon::Error::Socket, Excon::Error::Timeout,
+                Excon::Error::TooManyRedirects
+            raise if central_repo_urls.include?(repository_details["url"])
+
+            Nokogiri::XML("")
+          end
+        end
+
         def dependency_metadata(repository_details)
           @dependency_metadata ||= {}
           @dependency_metadata[repository_details.hash] ||=
-            begin
-              response = Excon.get(
-                dependency_metadata_url(repository_details.fetch("url")),
-                user: repository_details.fetch("username"),
-                password: repository_details.fetch("password"),
-                idempotent: true,
-                **Dependabot::SharedHelpers.excon_defaults
-              )
-              check_response(response, repository_details.fetch("url"))
-              Nokogiri::XML(response.body)
-            rescue URI::InvalidURIError
-              Nokogiri::XML("")
-            rescue Excon::Error::Socket, Excon::Error::Timeout,
-                   Excon::Error::TooManyRedirects
-              raise if central_repo_urls.include?(repository_details["url"])
-
-              Nokogiri::XML("")
-            end
+            fetchAsXml(dependency_metadata_url(
+              repository_details.fetch("url")),
+              repository_details)
         end
 
         def check_response(response, repository_url)
@@ -246,7 +317,10 @@ module Dependabot
 
         def dependency_metadata_url(repository_url)
           group_id, artifact_id = dependency.name.split(":")
+          dependency_metadata_url_custom_coordinates(repository_url, group_id, artifact_id)
+        end
 
+        def dependency_metadata_url_custom_coordinates(repository_url, group_id, artifact_id)
           "#{repository_url}/"\
           "#{group_id.tr('.', '/')}/"\
           "#{artifact_id}/"\
@@ -255,11 +329,25 @@ module Dependabot
 
         def dependency_files_url(repository_url, version)
           group_id, artifact_id = dependency.name.split(":")
+          dependency_files_url_custom_coordinates(repository_url, version, group_id, artifact_id)
+        end
 
+        def dependency_files_url_custom_coordinates(repository_url, version, group_id, artifact_id)
           "#{repository_url}/"\
           "#{group_id.tr('.', '/')}/"\
           "#{artifact_id}/"\
           "#{version}/"
+        end
+
+        def dependency_pom(mavenVersion)
+          repository_url = mavenVersion&.fetch(:source_url)
+          version = mavenVersion&.fetch(:version)
+          group_id, artifact_id = dependency.name.split(":")
+
+          "#{dependency_files_url(repository_url, version)}"\
+          "#{artifact_id}-"\
+          "#{version}"\
+          ".pom"
         end
 
         def version_class
